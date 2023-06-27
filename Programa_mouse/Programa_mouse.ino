@@ -4,10 +4,52 @@
 #include "Mouse.h"
 #include <SoftwareSerial.h>
 
-const int OFFSET_BUTTON = 4;
+#define MOUSE_TIME_THRESHOLD    200
+#define CLICK_TIME_THRESHOLD    200
+#define SWITCH_TIME_THRESHOLD   500
 
-//SoftwareSerial (9, 6);
+const int LEFT_CLICK_BUTTON = 2,
+          RIGHT_CLICK_BUTTON = 3,
+          OFFSET_BUTTON = 4,
+          MODE_SWITCH = 5;
+
 SoftwareSerial mySerial(9, 6);
+
+RF24 radio(8, 10);  // select  CSN and CE  pins
+const uint64_t pipeIn = 0xE8E8F0F0E1LL;  //IMPORTANT: The same as in the receiver!!!
+
+int mode = 1;
+
+struct MyData {
+  float angulo_x;
+  float angulo_y;
+  float angulo_z;
+};
+MyData data;
+MyData offset;
+
+int offsetCenter;
+
+struct Threshold {
+    float x_izq = 25.0;
+    float x_der = -25.0;
+    float y_abj = 25.0;
+    float y_arr = -25.0;
+};
+Threshold threshold;
+
+enum direcciones{
+  IZQUIERDA = 0,
+  DERECHA,
+  ABAJO, 
+  ARRIBA
+};
+int desplazamiento = 10, desplazamiento_scroll = 1;  // dezplazamiento del cursor (de 0 a 127 segun la libreria)
+
+
+unsigned long startTimeLeftClick = 0, startTimeRightClick = 0, startTimeModeSwitch = 0;
+
+// ----- Variables viejas -----
 float anguloz;
 float ultimo_anguloz;
 
@@ -22,15 +64,12 @@ int blue_offset = 0;
 int blue_sensibilidad;
 int blue_mode = 1;
 
-int mode;
-
 int serial;
 int offset_comienzo = 1;
 
 // mouse
 int mueve;
 // variables de calibracion mouse
-int desplazamiento = 5, desplazamiento_scroll = 1;  // dezplazamiento del cursor (de 0 a 127 segun la libreria)
 int rango = 20;          // rango desde donde se comienza a mover
 int rango2 = 35;         // rango desde donde se comienza a mover
 //int rango3 = 25;           // rango desde donde se comienza a mover
@@ -46,71 +85,264 @@ int demora_anterior4;
 
 int click;
 
-int offset;
-float offset_x;
-float offset_y;
-float offset_z;
-
 float posicion_x;
 float posicion_y;
 float posicion_z;
 
-const uint64_t pipeIn = 0xE8E8F0F0E1LL;  //IMPORTANT: The same as in the receiver!!!
-
-RF24 radio(8, 10);  // select  CSN and CE  pins
-
-struct MyData {
-  float angulo_x;
-  float angulo_y;
-  float angulo_z;
-};
-
-MyData data;
-MyData offset;
-MyData posicion;
-
-struct Threshold {
-    float x_izq = 25.0;
-    float x_der = -25.0;
-    float y_abj = 25.0;
-    float y_arr = -25.0;
-};
-Threshold threshold;
-
-const int MOUSE_THRESHOLD = 100;
 unsigned long mouseLastReady = 0;
 
-int timer3InterruptIndex = 1;
 
 void setup() {
 
-    pinMode(OFFSET_BUTTON, INPUT_PULLUP);  //offset
-    pinMode(5, INPUT_PULLUP);  //offset
+  pinMode(OFFSET_BUTTON, INPUT_PULLUP);  
+  pinMode(MODE_SWITCH, INPUT_PULLUP);  
 
-    Serial.begin(115200);  //Set the speed to 9600 bauds if you want.
-                        //You should always have the same speed selected in the serial monitor
-    while (!Serial) ;
+  noInterrupts();
+  // Interrupciones de pulsador por rising edge
+  attachInterrupt(digitalPinToInterrupt(LEFT_CLICK_BUTTON), left_click, RISING);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_CLICK_BUTTON), right_click, RISING);
+  interrupts();
 
-    mySerial.begin(9600);
-    // Mouse.begin();
+  Serial.begin(115200);   
+  while (!Serial) ;
 
-    Serial.println("Iniciando");
-    if (!radio.begin()) {
-        while (1) {
-            Serial.println("ERROR - Radio not found");
-            delay(2000);
-        }
-    }
-    Serial.println("The radio espantoso is the best");
+  mySerial.begin(9600);
+  // Mouse.begin();
 
-    radio.setAutoAck(false);
-    radio.setDataRate(RF24_250KBPS);
-    radio.openReadingPipe(1, pipeIn);
-    // We start the radio comunication
-    radio.startListening();
+  Serial.println("Iniciando");
+  while (!radio.begin()) {
+    Serial.println("ERROR - Radio not found");
+    delay(2000);
+  }
+  Serial.println("The radio espantoso is the best");
 
-    configuracion_dead_zone();
+  radio.setAutoAck(false);
+  radio.setDataRate(RF24_250KBPS);
+  radio.openReadingPipe(1, pipeIn);
+  
+  // We start the radio comunication
+  radio.startListening();
+
+  // Secuencia de configuracion dead zone
+  configuracion_dead_zone();
+  check_mode();
 }
+
+void loop() {
+    // Se recibe la data
+    if(radio.available()) {
+        radio.read(&data, sizeof(MyData));
+        // print_angulos(data.angulo_x, data.angulo_y, data.angulo_z);
+        apply_offset();
+        // dead_zone();
+        mode ? deteccion_movimiento_1() : deteccion_movimiento_2();
+    }
+
+    check_mode();
+}
+
+// --------------------------------------------------------------------- ISR
+
+void left_click() {
+  if(millis() - startTimeLeftClick > CLICK_TIME_THRESHOLD) {
+    startTimeLeftClick = millis();
+    Mouse.click(MOUSE_LEFT);
+  }
+}
+
+void right_click() {
+  if(millis() - startTimeRightClick > CLICK_TIME_THRESHOLD) {
+    startTimeRightClick = millis();
+    Mouse.click(MOUSE_RIGHT);
+  }
+}
+
+// --------------------------------------------------------------------- Funciones
+
+void configuracion_dead_zone() {
+  bool waiting;
+  int incomingByte = 0;
+  
+  Serial.println("--- CONFIGURACIÓN DE ZONA MUERTA ---");
+  
+  Serial.println("Aprete el pulsador de offset");
+  offsetCenter = digitalRead(OFFSET_BUTTON);
+  while(offsetCenter){
+    offsetCenter = digitalRead(OFFSET_BUTTON);
+  }
+  Serial.println("Seteando offset!");
+  offset.angulo_x = data.angulo_x;
+  offset.angulo_y = data.angulo_y;
+  offset.angulo_z = data.angulo_z;
+  
+  set_offset(IZQUIERDA);
+  set_offset(DERECHA);
+  set_offset(ABAJO);
+  set_offset(ARRIBA);
+
+  return;
+}
+
+void set_offset(direcciones dir) {
+  switch(dir) {
+    case 0:
+      Serial.println("Mueva la cabeza hacia la IZQUIERDA y pulse el boton de offset");
+      break;
+    case 1:
+      Serial.println("Mueva la cabeza hacia la DERECHA y pulse el boton de offset");
+      break;
+    case 2:
+      Serial.println("Mueva la cabeza hacia la ABAJO y pulse el boton de offset");
+      break;
+    case 3:
+      Serial.println("Mueva la cabeza hacia la ARRIBA y pulse el boton de offset");
+      break;
+  }
+  delay(2000);
+  
+  bool waiting = 1;
+  while(waiting){
+    if(radio.available()){
+      radio.read(&data, sizeof(MyData));
+      apply_offset();
+    }
+
+    if(digitalRead(OFFSET_BUTTON) == 0)
+      waiting = 0;
+  }
+
+  switch(dir){
+    case 0:
+      threshold.x_izq = data.angulo_x;
+      Serial.print("THS IZQ: ");        
+      Serial.println(threshold.x_izq);        
+      break;
+    case 1:
+      threshold.x_der = data.angulo_x;        
+      Serial.print("THS DER: ");        
+      Serial.println(threshold.x_der);        
+      break;
+    case 2:
+      threshold.y_abj = data.angulo_y;        
+      Serial.print("THS ABJ: ");        
+      Serial.println(threshold.y_abj);        
+      break;
+    case 3:
+      threshold.y_arr = data.angulo_y;        
+      Serial.print("THS ARR: ");        
+      Serial.println(threshold.y_arr);        
+      break;
+  }
+  return;
+}
+
+void check_mode() {
+  if(millis() - startTimeModeSwitch > SWITCH_TIME_THRESHOLD) {
+    startTimeModeSwitch = millis();
+    if(mode != digitalRead(MODE_SWITCH)){
+      mode = !mode;
+      // if(mode){
+      //   Serial.println("Cambio a modo mouse.");
+      //   delay(2000); // Sacar el delay
+      // }
+      // else{
+      //   Serial.println("Cambio a modo lectura.");
+      //   delay(2000);
+      // }
+    }
+  }
+}
+
+void deteccion_movimiento_1() {
+  
+  if(mouseReady()) {
+    mouseLastReady = millis();
+    // Mueve IZQUIEDA
+    if(data.angulo_x < threshold.x_izq){
+      Serial.println("IZQUIERDA");
+      Mouse.move(-desplazamiento, 0, 0);
+    }
+    // Mueve DERECHA
+    if(data.angulo_x > threshold.x_der){
+      Serial.println("DERECHA");
+      Mouse.move(desplazamiento, 0, 0);
+    }
+    // Mueve ABAJO
+    if(data.angulo_y < threshold.y_abj){
+      Serial.println("ABAJO");
+      Mouse.move(0, desplazamiento, 0);
+    }
+    // Mueve ARRIBA
+    if(data.angulo_y > threshold.y_arr){
+      Serial.println("ARRIBA");
+      Mouse.move(0, -desplazamiento, 0);
+    }
+  }
+}
+
+void deteccion_movimiento_2() {
+
+  if(mouseReady()){
+    mouseLastReady = millis();
+
+    if(data.angulo_y < threshold.y_abj){
+      Serial.println("SCROLL DOWN");
+      Mouse.move(0, 0, -desplazamiento_scroll);
+    }
+    if(data.angulo_y > threshold.y_arr){
+      Serial.println("SCROLL UP");
+      Mouse.move(0, 0, desplazamiento_scroll);
+    }
+  }
+}
+
+bool mouseReady() {
+  return (millis() - mouseLastReady) > MOUSE_TIME_THRESHOLD;
+}
+
+void apply_offset() {
+    offsetCenter = digitalRead(OFFSET_BUTTON);
+    if (offsetCenter == 0) {
+      // Serial.println("Seteando offset!");
+      offset.angulo_x = data.angulo_x;
+      offset.angulo_y = data.angulo_y;
+      offset.angulo_z = data.angulo_z;
+    }
+
+    data.angulo_x = data.angulo_x - offset.angulo_x;
+    data.angulo_y = data.angulo_y - offset.angulo_y;
+    data.angulo_z = data.angulo_z - offset.angulo_z;
+    print_angulos(data.angulo_x, data.angulo_y, data.angulo_z);
+}
+
+// --------------------------------------------------------------------- Serial prints
+
+void print_angulos(float x, float y, float z) {
+    Serial.print("X ");
+    Serial.print(x);
+    Serial.print(" | Y ");
+    Serial.print(y);
+    Serial.print(" | Z ");
+    Serial.println(z);
+}
+
+void dead_zone() {
+    if(data.angulo_x < threshold.x_izq){
+        Serial.println("IZQUIERDA");
+    }
+    if(data.angulo_x > threshold.x_der){
+        Serial.println("DERECHA");
+    }
+    if(data.angulo_y < threshold.y_abj){
+        Serial.println("ABAJO");
+    }
+    if(data.angulo_y > threshold.y_arr){
+        Serial.println("ARRIBA");
+    }
+    return;
+}
+
+// --------------------------------------------------------------------- Cosas viejas para revisar / borrar
 
 // void Tiempo() {
 //   demora = millis();
@@ -205,63 +437,6 @@ void setup() {
 // }
 
 
-void deteccion_movimiento_1() {
-
-  if(mouseReady()){
-    mouseLastReady = millis();
-    // Mueve IZQUIEDA
-    if(data.angulo_x < threshold.x_izq){
-      Serial.println("IZQUIERDA");
-      Mouse.move(-desplazamiento, 0, 0);
-    }
-    // Mueve DERECHA
-    if(data.angulo_x > threshold.x_der){
-      Serial.println("DERECHA");
-      Mouse.move(desplazamiento, 0, 0);
-    }
-    // Mueve ABAJO
-    if(data.angulo_y < threshold.y_abj){
-      Serial.println("ABAJO");
-      Mouse.move(0, desplazamiento, 0);
-    }
-    // Mueve ARRIBA
-    if(data.angulo_y > threshold.y_arr){
-      Serial.println("ARRIBA");
-      Mouse.move(0, -desplazamiento, 0);
-    }
-    
-    // FALTA AGREGAR LOS CLICKS
-
-    // if (posicion_z > rango2 && click == 1) {
-    //   demora_anterior3 = demora;
-    // if (offset == 0) {
-    //   Mouse.click(MOUSE_RIGHT);
-    //   click = 0;
-    // }
-    // //click izquierdo
-    // if (posicion_z < -rango2 && click == 1) {
-    //   click = 0;
-    //   demora_anterior3 = demora;
-    //   Mouse.click(MOUSE_LEFT);
-    // }
-  }
-}
-
-void deteccion_movimiento_2() {
-
-  if(mouseReady()){
-    mouseLastReady = millis();
-
-    if(data.angulo_y < threshold.y_abj){
-      Serial.println("SCROLL DOWN");
-      Mouse.move(0, 0, -desplazamiento_scroll);
-    }
-    if(data.angulo_y > threshold.y_arr){
-      Serial.println("SCROLL UP");
-      Mouse.move(0, 0, desplazamiento_scroll);
-    }
-  }
-}
 
 // void Bluethooth() {
 //   if (mySerial.available() > 0) {
@@ -317,153 +492,22 @@ void deteccion_movimiento_2() {
 //   }
 // }
 
-void configuracion_dead_zone() {
-  bool waiting;
-  int incomingByte = 0;
-  
-  Serial.println("--- CONFIGURACIÓN DE ZONA MUERTA ---");
-  
-  Serial.println("Aprete el pulsador de offset");
-  offset = digitalRead(OFFSET_BUTTON);
-  while(offset){
-    offset = digitalRead(OFFSET_BUTTON);
-  }
-  Serial.println("Seteando offset!");
-  offset_x = data.angulo_x;
-  offset_y = data.angulo_y;
-  offset_z = data.angulo_z;
+// void loop() {
+//     // Se recibe la data
+//     if (radio.available()) {
+//         radio.read(&data, sizeof(MyData));
+//         // print_angulos(data.angulo_x, data.angulo_y, data.angulo_z);
+//         apply_offset();
+//         // dead_zone();
+//         // deteccion_movimiento_1();
+//         deteccion_movimiento_2();
+//     }
 
-  Serial.println("Mueva la cabeza hacia la IZQUIERDA y escriba O para setear threshold");
-  delay(2000);
-  waiting = 1;
-  while(waiting){
-    if (radio.available()) {
-      radio.read(&data, sizeof(MyData));
-      apply_offset();
-    }
-    if(digitalRead(OFFSET_BUTTON) == 0){    
-      threshold.x_izq = data.angulo_x;
-      Serial.print("THS IZQ: ");        
-      Serial.println(threshold.x_izq);        
-      waiting = 0;
-    }
-  }
-  Serial.println("Mueva la cabeza hacia la DERECHA y escriba O para setear threshold");
-  delay(2000);;;
-  waiting = 1;
-  while(waiting){
-    if (radio.available()) {
-      radio.read(&data, sizeof(MyData));
-      apply_offset();
-    }
-    if(digitalRead(OFFSET_BUTTON) == 0){    
-      threshold.x_der = data.angulo_x;        
-      Serial.print("THS DER: ");        
-      Serial.println(threshold.x_der);        
-      waiting = 0;
-    }
-  }
-  Serial.println("Mueva la cabeza hacia la ABAJO y escriba O para setear threshold");
-  delay(2000);;
-  waiting = 1;
-  while(waiting){
-    if (radio.available()) {
-      radio.read(&data, sizeof(MyData));
-      apply_offset();
-    }
-    if(digitalRead(OFFSET_BUTTON) == 0){    
-      threshold.y_abj = data.angulo_y;        
-      Serial.print("THS ABJ: ");        
-      Serial.println(threshold.y_abj);        
-      waiting = 0;
-    }
-  }
-  Serial.println("Mueva la cabeza hacia la ARRIBA y escriba O para setear threshold");
-  delay(2000);
-  waiting = 1;
-  while(waiting){
-    if (radio.available()) {
-      radio.read(&data, sizeof(MyData));
-      apply_offset();
-    }
-    if(digitalRead(OFFSET_BUTTON) == 0){    
-      threshold.y_arr = data.angulo_y;        
-      Serial.print("THS ARR: ");        
-      Serial.println(threshold.y_arr);        
-      waiting = 0;
-    }
-  }
-  return;
-}
-
-bool mouseReady() {
-  return (millis() - mouseLastReady) > MOUSE_THRESHOLD;
-}
-
-void apply_offset() {
-    offset = digitalRead(OFFSET_BUTTON);
-    if (offset == 0) {
-        // Serial.println("Seteando offset!");
-        offset_x = data.angulo_x;
-        offset_y = data.angulo_y;
-        offset_z = data.angulo_z;
-    }
-
-    data.angulo_x = data.angulo_x - offset_x;
-    data.angulo_y = data.angulo_y - offset_y;
-    data.angulo_z = data.angulo_z - offset_z;
-    print_angulos(data.angulo_x, data.angulo_y, data.angulo_z);
-}
-
-
-void print_angulos(float x, float y, float z) {
-    //Mostrar los angulos separadas
-    Serial.print("X ");
-    Serial.print(x);
-    Serial.print(" | Y ");
-    Serial.print(y);
-    Serial.print(" | Z ");
-    Serial.println(z);
-}
-
-void dead_zone() {
-    // Dejar movimientos perpendiculares o agregar diagonales?
-    // Como está ahora permite un mov por vez unicamente, sino sacar return
-    // Se podría considerar unicamente el max de los dos ejes y tomar ese
-
-    // Hacer función de seteo porcentual considerando los máximos desplazamientos por Bt
-    // En tal caso, si se quiere considerar el desplazamiento max, también tendría que ser porcentual
-    if(data.angulo_x < threshold.x_izq){
-        Serial.println("IZQUIERDA");
-    }
-    if(data.angulo_x > threshold.x_der){
-        Serial.println("DERECHA");
-    }
-    if(data.angulo_y < threshold.y_abj){
-        Serial.println("ABAJO");
-    }
-    if(data.angulo_y > threshold.y_arr){
-        Serial.println("ARRIBA");
-    }
-    return;
-}
-
-void loop() {
-    // Se recibe la data
-    if (radio.available()) {
-        radio.read(&data, sizeof(MyData));
-        // print_angulos(data.angulo_x, data.angulo_y, data.angulo_z);
-        apply_offset();
-        // dead_zone();
-        // deteccion_movimiento_1();
-        deteccion_movimiento_2();
-    }
-
-    // Esto es lo bueno
-    // if(mouseReady) {
-    //     mouseLastReady = millis();
-    //     monitor_print();
-    // }
+//     // Esto es lo bueno
+//     // if(mouseReady) {
+//     //     mouseLastReady = millis();
+//     //     monitor_print();
+//     // }
 
     // if (offset_comienzo == 1 && radio.available()) {
     //     offset_x = data.angulo_x;
@@ -496,4 +540,4 @@ void loop() {
     // rango = constrain(rango, 1, 10);
     // desplazamiento = constrain(desplazamiento, 1, 10);
     // Offset();
-}
+// }
