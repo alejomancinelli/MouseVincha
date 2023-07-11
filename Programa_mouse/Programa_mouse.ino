@@ -4,7 +4,7 @@
 #include "Mouse.h"
 #include <SoftwareSerial.h>
 
-#define MOUSE_TIME_THRESHOLD    200
+#define MOUSE_TIME_THRESHOLD    50
 #define CLICK_TIME_THRESHOLD    200
 #define SWITCH_TIME_THRESHOLD   500
 
@@ -44,15 +44,12 @@ enum direcciones{
   ABAJO, 
   ARRIBA
 };
-int desplazamiento = 10, desplazamiento_scroll = 1;  // dezplazamiento del cursor (de 0 a 127 segun la libreria)
-
+int desplazamiento = 5, desplazamiento_scroll = 1;  // dezplazamiento del cursor (de 0 a 127 segun la libreria)
 
 unsigned long startTimeLeftClick = 0, startTimeRightClick = 0, startTimeModeSwitch = 0;
+unsigned long mouseLastReady = 0;
 
 // ----- Variables viejas -----
-float anguloz;
-float ultimo_anguloz;
-
 // bluetooth
 int range = 20;
 int vel = 10;
@@ -64,33 +61,7 @@ int blue_offset = 0;
 int blue_sensibilidad;
 int blue_mode = 1;
 
-int serial;
-int offset_comienzo = 1;
-
-// mouse
-int mueve;
-// variables de calibracion mouse
-int rango = 20;          // rango desde donde se comienza a mover
-int rango2 = 35;         // rango desde donde se comienza a mover
-//int rango3 = 25;           // rango desde donde se comienza a mover
-int tiempo1 = 30;    // cada cuantos mili segundos se mueve
-int tiempo2 = 1000;  //monitor serie
-int tiempo3 = 2000;  // tiempo de click
-
-int demora;
-int demora_anterior1;
-int demora_anterior2;
-int demora_anterior3;
-int demora_anterior4;
-
-int click;
-
-float posicion_x;
-float posicion_y;
-float posicion_z;
-
-unsigned long mouseLastReady = 0;
-
+// --------------------------------------------------------------------- Main Functions
 
 void setup() {
 
@@ -139,6 +110,7 @@ void loop() {
     }
 
     check_mode();
+    // Bluethooth();
 }
 
 // --------------------------------------------------------------------- ISR
@@ -168,6 +140,8 @@ void configuracion_dead_zone() {
   Serial.println("Aprete el pulsador de offset");
   offsetCenter = digitalRead(OFFSET_BUTTON);
   while(offsetCenter){
+    if(radio.available())
+      radio.read(&data, sizeof(MyData));
     offsetCenter = digitalRead(OFFSET_BUTTON);
   }
   Serial.println("Seteando offset!");
@@ -239,16 +213,8 @@ void set_offset(direcciones dir) {
 void check_mode() {
   if(millis() - startTimeModeSwitch > SWITCH_TIME_THRESHOLD) {
     startTimeModeSwitch = millis();
-    if(mode != digitalRead(MODE_SWITCH)){
+    if(mode != digitalRead(MODE_SWITCH)) {
       mode = !mode;
-      // if(mode){
-      //   Serial.println("Cambio a modo mouse.");
-      //   delay(2000); // Sacar el delay
-      // }
-      // else{
-      //   Serial.println("Cambio a modo lectura.");
-      //   delay(2000);
-      // }
     }
   }
 }
@@ -257,6 +223,7 @@ void deteccion_movimiento_1() {
   
   if(mouseReady()) {
     mouseLastReady = millis();
+    
     // Mueve IZQUIEDA
     if(data.angulo_x < threshold.x_izq){
       Serial.println("IZQUIERDA");
@@ -342,6 +309,61 @@ void dead_zone() {
     return;
 }
 
+// --------------------------------------------------------------------- Bluetooth
+
+// void Bluethooth() {
+//   if(mySerial.available() > 0) {
+//     char comando = mySerial.read();
+    
+//     switch (comando) {  // a=arriba, b=below, d=derecha, i=izquierda, y=click izquierdo, z=click derecho, c = configuracion
+//       case 'a':
+//         Mouse.move(0, (range * vel), 0);
+//         break;
+//       case 'b':
+//         Mouse.move(0, -(range * vel), 0);
+//         break;
+//       case 'd':
+//         Mouse.move(-(range * vel), 0, 0);
+//         break;
+//       case 'i':
+//         Mouse.move((range * vel), 0, 0);
+//         break;
+//       case 'y':
+//         Mouse.click(MOUSE_LEFT);
+//         break;
+//       case 'z':
+//         Mouse.click(MOUSE_RIGHT);
+//         break;
+//       case 'n':
+//         blue_offset = 1;
+//         break;
+//       case 'j':
+//         blue_offset = 0;
+//         break;
+//       case 'c':
+//         MODE_conf = 1;
+//         break;
+//       case 'r':
+//         rango++;
+//         break;
+//       case 't':
+//         rango--;
+//         break;
+//       case 'p':
+//         desplazamiento++;
+//         break;
+//       case 'w':
+//         desplazamiento--;
+//         break;
+//       case 'g':
+//         blue_mode = 1;
+//         break;
+//       case 'k':
+//         blue_mode = 2;
+//         break;
+//     }
+//   }
+// }
 // --------------------------------------------------------------------- Cosas viejas para revisar / borrar
 
 // void Tiempo() {
@@ -438,59 +460,6 @@ void dead_zone() {
 
 
 
-// void Bluethooth() {
-//   if (mySerial.available() > 0) {
-
-//     comando = mySerial.read();
-//     switch (comando) {  // a=arriba, b=below, d=derecha, i=izquierda, y=click izquierdo, z=click derecho, c = configuracion
-//       case 'a':
-//         Mouse.move(0, (range * vel), 0);
-//         break;
-//       case 'b':
-//         Mouse.move(0, -(range * vel), 0);
-//         break;
-//       case 'd':
-//         Mouse.move(-(range * vel), 0, 0);
-//         break;
-//       case 'i':
-//         Mouse.move((range * vel), 0, 0);
-//         break;
-//       case 'y':
-//         Mouse.click(MOUSE_LEFT);
-//         break;
-//       case 'z':
-//         Mouse.click(MOUSE_RIGHT);
-//         break;
-//       case 'n':
-//         blue_offset = 1;
-//         break;
-//       case 'j':
-//         blue_offset = 0;
-//         break;
-//       case 'c':
-//         MODE_conf = 1;
-//         break;
-//       case 'r':
-//         rango++;
-//         break;
-//       case 't':
-//         rango--;
-//         break;
-//       case 'p':
-//         desplazamiento++;
-//         break;
-//       case 'w':
-//         desplazamiento--;
-//         break;
-//       case 'g':
-//         blue_mode = 1;
-//         break;
-//       case 'k':
-//         blue_mode = 2;
-//         break;
-//     }
-//   }
-// }
 
 // void loop() {
 //     // Se recibe la data
