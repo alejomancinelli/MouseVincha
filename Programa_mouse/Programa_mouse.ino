@@ -4,20 +4,26 @@
 #include "Mouse.h"
 #include <SoftwareSerial.h>
 
-#define MOUSE_TIME_THRESHOLD    50
-#define CLICK_TIME_THRESHOLD    200
-#define SWITCH_TIME_THRESHOLD   500
+#define CLICK_TIME_THRESHOLD      200
+#define SWITCH_TIME_THRESHOLD     500
+#define LED_TOGGLE_TIME           25 
+#define MOUSE_THRESHOLD_INDEX_MAX 10   
 
 const int LEFT_CLICK_BUTTON = 2,
           RIGHT_CLICK_BUTTON = 3,
-          OFFSET_BUTTON = 4,
-          MODE_SWITCH = 5;
+          MODE_SWITCH = 4,
+          OFFSET_BUTTON = 5,
+          GREEN_LED = 6;
 
-SoftwareSerial mySerial(9, 6);
+SoftwareSerial mySerial(9, 8); 
+// 8: Arduino Tx - BT Rx
+// 9: Arduino Rx - BT Tx
 
-RF24 radio(8, 10);  // select  CSN and CE  pins
+RF24 radio(A0, 10);  // select  CSN and CE  pins
 const uint64_t pipeIn = 0xE8E8F0F0E1LL;  //IMPORTANT: The same as in the receiver!!!
 
+const int MOUSE_TIME_THRESHOLD_ARRAY[MOUSE_THRESHOLD_INDEX_MAX] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+int mouse_time_threshold, mouse_threshold_index = 4;
 int mode = 1;
 
 struct MyData {
@@ -46,20 +52,18 @@ enum direcciones{
 };
 int desplazamiento = 5, desplazamiento_scroll = 1;  // dezplazamiento del cursor (de 0 a 127 segun la libreria)
 
+bool deadzone_config_rdy = 0;
+
 unsigned long startTimeLeftClick = 0, startTimeRightClick = 0, startTimeModeSwitch = 0;
 unsigned long mouseLastReady = 0;
 
+bool led_state = 0;
+int timer1InterruptCounter = 0;
+
 // ----- Variables viejas -----
 // bluetooth
-int range = 20;
-int vel = 10;
+int desplazamiento_bt = 5;
 char comando;
-int MODE_conf = 0;
-int blue_config;
-
-int blue_offset = 0;
-int blue_sensibilidad;
-int blue_mode = 1;
 
 // --------------------------------------------------------------------- Main Functions
 
@@ -67,8 +71,10 @@ void setup() {
 
   pinMode(OFFSET_BUTTON, INPUT_PULLUP);  
   pinMode(MODE_SWITCH, INPUT_PULLUP);  
+  pinMode(GREEN_LED, OUTPUT);
 
   noInterrupts();
+  setup_timer_1();
   // Interrupciones de pulsador por rising edge
   attachInterrupt(digitalPinToInterrupt(LEFT_CLICK_BUTTON), left_click, RISING);
   attachInterrupt(digitalPinToInterrupt(RIGHT_CLICK_BUTTON), right_click, RISING);
@@ -78,7 +84,7 @@ void setup() {
   while (!Serial) ;
 
   mySerial.begin(9600);
-  // Mouse.begin();
+  Mouse.begin();
 
   Serial.println("Iniciando");
   while (!radio.begin()) {
@@ -94,12 +100,22 @@ void setup() {
   // We start the radio comunication
   radio.startListening();
 
-  // Secuencia de configuracion dead zone
-  configuracion_dead_zone();
+  digitalWrite(GREEN_LED, LOW);
+
   check_mode();
+
+  digitalWrite(GREEN_LED, LOW);
+  led_state = 0;
+  mouse_time_threshold = MOUSE_TIME_THRESHOLD_ARRAY[mouse_threshold_index];
 }
 
 void loop() {
+    if(!deadzone_config_rdy && !digitalRead(OFFSET_BUTTON)) {
+      // Secuencia de configuracion dead zone
+      configuracion_dead_zone();
+      deadzone_config_rdy = 1;
+    }
+
     // Se recibe la data
     if(radio.available()) {
         radio.read(&data, sizeof(MyData));
@@ -110,10 +126,20 @@ void loop() {
     }
 
     check_mode();
-    // Bluethooth();
+    Bluethooth();
 }
 
 // --------------------------------------------------------------------- ISR
+
+// Interrupción Timer 1 para parpadeo de led
+ISR(TIMER1_COMPA_vect) {
+  timer1InterruptCounter++;
+  if(timer1InterruptCounter == LED_TOGGLE_TIME){
+    led_state = !led_state;
+    digitalWrite(GREEN_LED, led_state);
+    timer1InterruptCounter = 0;
+  }
+}
 
 void left_click() {
   if(millis() - startTimeLeftClick > CLICK_TIME_THRESHOLD) {
@@ -130,6 +156,20 @@ void right_click() {
 }
 
 // --------------------------------------------------------------------- Funciones
+// Interrupcion cada 10ms
+void setup_timer_1(){
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+  OCR1A = 20000;
+  TCCR1B |= (1 << WGM12);   //CTC
+  TCCR1B |= (1 << CS11);    // Prescaler 256
+  timer_1_ISR_disable();
+}
+
+void timer_1_ISR_enable() { TIMSK1 |= (1 << OCIE1A); }
+
+void timer_1_ISR_disable() { TIMSK1 &= ~(1 << OCIE1A); }
 
 void configuracion_dead_zone() {
   bool waiting;
@@ -158,6 +198,9 @@ void configuracion_dead_zone() {
 }
 
 void set_offset(direcciones dir) {
+  digitalWrite(GREEN_LED, HIGH);
+  led_state = 1;
+
   switch(dir) {
     case 0:
       Serial.println("Mueva la cabeza hacia la IZQUIERDA y pulse el boton de offset");
@@ -173,6 +216,8 @@ void set_offset(direcciones dir) {
       break;
   }
   delay(2000);
+  
+  timer_1_ISR_enable();
   
   bool waiting = 1;
   while(waiting){
@@ -207,6 +252,7 @@ void set_offset(direcciones dir) {
       Serial.println(threshold.y_arr);        
       break;
   }
+  timer_1_ISR_disable();
   return;
 }
 
@@ -264,7 +310,7 @@ void deteccion_movimiento_2() {
 }
 
 bool mouseReady() {
-  return (millis() - mouseLastReady) > MOUSE_TIME_THRESHOLD;
+  return (millis() - mouseLastReady) > mouse_time_threshold;
 }
 
 void apply_offset() {
@@ -279,7 +325,7 @@ void apply_offset() {
     data.angulo_x = data.angulo_x - offset.angulo_x;
     data.angulo_y = data.angulo_y - offset.angulo_y;
     data.angulo_z = data.angulo_z - offset.angulo_z;
-    print_angulos(data.angulo_x, data.angulo_y, data.angulo_z);
+    // print_angulos(data.angulo_x, data.angulo_y, data.angulo_z);
 }
 
 // --------------------------------------------------------------------- Serial prints
@@ -311,202 +357,65 @@ void dead_zone() {
 
 // --------------------------------------------------------------------- Bluetooth
 
-// void Bluethooth() {
-//   if(mySerial.available() > 0) {
-//     char comando = mySerial.read();
+// --- Cuando se termine la app ver que comando corresponde a cada letra o tal
+// --- Secuencia guíada de inicialización? Al menos los pasos
+// --- Se podría ver de cambiar el área de no detección
+
+void Bluethooth() {
+  if(mySerial.available() > 0) {
+    char comando = mySerial.read();
     
-//     switch (comando) {  // a=arriba, b=below, d=derecha, i=izquierda, y=click izquierdo, z=click derecho, c = configuracion
-//       case 'a':
-//         Mouse.move(0, (range * vel), 0);
-//         break;
-//       case 'b':
-//         Mouse.move(0, -(range * vel), 0);
-//         break;
-//       case 'd':
-//         Mouse.move(-(range * vel), 0, 0);
-//         break;
-//       case 'i':
-//         Mouse.move((range * vel), 0, 0);
-//         break;
-//       case 'y':
-//         Mouse.click(MOUSE_LEFT);
-//         break;
-//       case 'z':
-//         Mouse.click(MOUSE_RIGHT);
-//         break;
-//       case 'n':
-//         blue_offset = 1;
-//         break;
-//       case 'j':
-//         blue_offset = 0;
-//         break;
-//       case 'c':
-//         MODE_conf = 1;
-//         break;
-//       case 'r':
-//         rango++;
-//         break;
-//       case 't':
-//         rango--;
-//         break;
-//       case 'p':
-//         desplazamiento++;
-//         break;
-//       case 'w':
-//         desplazamiento--;
-//         break;
-//       case 'g':
-//         blue_mode = 1;
-//         break;
-//       case 'k':
-//         blue_mode = 2;
-//         break;
-//     }
-//   }
-// }
-// --------------------------------------------------------------------- Cosas viejas para revisar / borrar
+    switch (comando) {  // a=arriba, b=below, d=derecha, i=izquierda, y=click izquierdo, z=click derecho, c = configuracion
+      case 'a':
+        Mouse.move(0, -desplazamiento_bt, 0);
+        break;
+      case 'b':
+        Mouse.move(0, desplazamiento_bt, 0);
+        break;
+      case 'd':
+        Mouse.move(desplazamiento_bt, 0, 0);
+        break;
+      case 'i':
+        Mouse.move(-desplazamiento_bt, 0, 0);
+        break;
+      case 'y':
+        Mouse.click(MOUSE_LEFT);
+        break;
+      case 'z':
+        Mouse.click(MOUSE_RIGHT);
+        break;
+      case 'p':
+        if(desplazamiento < 10) {
+          desplazamiento++;
+          Serial.print("Mouse desplazamiento: ");
+          Serial.println(desplazamiento);
+        }
+        break;
+      case 'w':
+        if(desplazamiento > 1) {
+          desplazamiento--;
+          Serial.print("Mouse desplazamiento: ");
+          Serial.println(desplazamiento);
+        }
+        break;
+      case 'r':
+        if(mouse_threshold_index < MOUSE_THRESHOLD_INDEX_MAX - 1){
+          mouse_threshold_index++;
+          mouse_time_threshold = MOUSE_TIME_THRESHOLD_ARRAY[mouse_threshold_index];
+          Serial.print("Mouse THS: ");
+          Serial.println(mouse_time_threshold);
+        }
+        break;
+      case 't':
+        if(mouse_threshold_index > 0){
+          mouse_threshold_index--;
+          mouse_time_threshold = MOUSE_TIME_THRESHOLD_ARRAY[mouse_threshold_index];
+          Serial.print("Mouse THS: ");
+          Serial.println(mouse_time_threshold);
+        }
+        break;
+     // Cambiar modo (medio innecesario pero bueno)
+    }
+  }
+}
 
-// void Tiempo() {
-//   demora = millis();
-//   if (demora - demora_anterior1 >= tiempo1) {
-//     demora_anterior1 = demora;
-//     mueve = 1;
-//   }
-
-//   if (demora - demora_anterior2 >= tiempo2) {
-//     demora_anterior2 = demora;
-//     serial = 1;
-//   }
-//   if (demora - demora_anterior3 >= tiempo3) {
-//     demora_anterior3 = demora;
-//     click = 1;
-//   }
-// }
-
-// void Monitorprint() {
-//   if (serial == 1 && offset == 1) {
-//     Serial.print("Angulo:");
-//     Serial.print("        ");
-//     Serial.print(data.angulo_x);
-//     Serial.print("        ");
-//     Serial.print(data.angulo_y);
-//     Serial.print("        ");
-//     Serial.print(data.angulo_z);
-//     Serial.println("     ");
-
-//     Serial.print("Offset:");
-//     Serial.print("        ");
-//     Serial.print(offset_x);
-//     Serial.print("        ");
-//     Serial.print(offset_y);
-//     Serial.print("        ");
-//     Serial.print(offset_z);
-//     Serial.println("     ");
-
-//     Serial.print("Posicion:");
-//     Serial.print("        ");
-//     Serial.print(posicion_x);
-//     Serial.print("        ");
-//     Serial.print(posicion_y);
-//     Serial.print("        ");
-//     Serial.print(posicion_z);
-//     Serial.println("     ");
-
-//     if (-rango < posicion_x && posicion_x < rango && -rango < posicion_y && posicion_y < rango && -rango < posicion_z && posicion_z < rango) {
-//       Serial.println("Cabeza en el centro");
-//     }
-//     // mueve a la derecha
-//     if (rango < posicion_x) {
-//       Serial.println("INCLINA A LA DERECHA");
-//     }
-//     if (posicion_x < -rango) {
-//       Serial.println("INCLINA A LA IZQUIERDA");
-//     }
-//     if (rango < posicion_y) {
-//       Serial.println("CABEZA ARRIBA");
-//     }
-//     if (posicion_y < -rango) {
-//       Serial.println("CABEZA ABAJO");
-//     }
-//     if (posicion_z < -rango2 && click == 0) {
-
-//       Serial.println("CLICK IZQUIERDA");
-//     }
-//     if (posicion_z > rango2 && click == 0) {
-
-//       Serial.println("CLICK DERECHO");
-//     }
-//     Serial.print("DESPLAZAMIENTO:    ");
-//     Serial.println(desplazamiento);
-//     Serial.print("RANGO:      ");
-//     Serial.println(rango);
- 
-//     if (mode == 1) {
-//       switch (blue_mode) {
-//         case 1:
-//           Serial.println("MODO ESCRITURA");  // activa modo escritura
-//           break;
-//         case 2:
-//           Serial.println("MODO LECTURA");  //activa modo lectura (scroll)
-//           break;
-//       }
-//     }
-//     if (mode == 0) {
-//       Serial.println("MODO LECTURA"); 
-//     }
-//   }
-//   serial = 0;
-// }
-
-
-
-
-// void loop() {
-//     // Se recibe la data
-//     if (radio.available()) {
-//         radio.read(&data, sizeof(MyData));
-//         // print_angulos(data.angulo_x, data.angulo_y, data.angulo_z);
-//         apply_offset();
-//         // dead_zone();
-//         // deteccion_movimiento_1();
-//         deteccion_movimiento_2();
-//     }
-
-//     // Esto es lo bueno
-//     // if(mouseReady) {
-//     //     mouseLastReady = millis();
-//     //     monitor_print();
-//     // }
-
-    // if (offset_comienzo == 1 && radio.available()) {
-    //     offset_x = data.angulo_x;
-    //     offset_y = data.angulo_y;
-    //     offset_z = data.angulo_z;
-    //     Serial.println("Seteando offset!");
-    //     offset_comienzo = 0;
-    // }
-
-    // Bluethooth();
-    // Tiempo();
-    // Monitorprint();
-    
-    // mode = digitalRead(5);
-    
-    // if (mode == 1) {
-    //     switch (blue_mode) {
-    //     case 1:
-    //         Deteccion_movimiento1();  // activa modo escritura
-    //         break;
-    //     case 2:
-    //         Deteccion_movimiento2();  //activa modo lectura (scroll)
-    //         break;
-    //     }
-    // }
-    // if (mode == 0) {
-    //     Deteccion_movimiento2();
-    // }
-
-    // rango = constrain(rango, 1, 10);
-    // desplazamiento = constrain(desplazamiento, 1, 10);
-    // Offset();
-// }
